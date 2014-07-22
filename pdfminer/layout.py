@@ -1,4 +1,9 @@
 #!/usr/bin/env python
+
+import collections
+
+from scipy.stats import chisquare
+
 from .utils import INF
 from .utils import Plane
 from .utils import get_bound
@@ -107,6 +112,8 @@ class LTComponent(LTItem):
         self.width = x1-x0
         self.height = y1-y0
         self.bbox = bbox
+        self.xc = 0.5*(x0+x1)
+        self.yc = 0.5*(y0+y1)
         return
 
     def is_empty(self):
@@ -148,6 +155,8 @@ class LTComponent(LTItem):
         else:
             return 0
 
+    def center(self):
+        return (self.xc, self.yc)
 
 ##  LTCurve
 ##
@@ -663,6 +672,178 @@ class LTLayoutContainer(LTContainer):
         assert len(plane) == 1
         return list(plane)
 
+    def can_reject_uniform(self, values, n_bins=20, n_edge_bins=0,
+                           significance_level=0.001):
+        """Test whether the set of values comes from a uniform distribution
+        disregarding the `n_edge_bins` on either side of the
+        distribution to account for indentation and ragged formatting
+        as necessary.
+        """
+
+        # set up the boundaries for chi2 tests
+        values.sort()
+        dx = (values[-1] - values[0]) / n_bins
+        bin_boundaries = [i*dx+values[0] for i in range(n_bins+1)]
+
+        # count up the number of observed occurrences in each bin
+        bin = 0
+        counts = [0] * n_bins
+        for value in values:
+            bin_lwr, bin_upr = bin_boundaries[bin:bin+2]
+            if bin_lwr <= value < bin_upr or value == values[-1]:
+                counts[bin] += 1
+            else:
+                bin += 1
+                counts[bin] += 1
+        if n_edge_bins:
+            counts = counts[n_edge_bins:-n_edge_bins]
+        chi2, pvalue = chisquare(counts)
+        return pvalue, pvalue<significance_level
+
+    def get_column_x_bounds(self, textobjs, epsilon=0.05):
+        """Identify the boundary in the x-direction between any columns (if
+        they exist)
+
+        Only consider the text objects that have a y coordinate
+        between epsilon and 1-epsilon of the way from the lowest
+        charater to the highest character. This avoids issues with
+        headers and footers that can trip up this overly simple
+        algorithm.
+        """
+
+        # find the center of all the characters
+        xs, ys = [], []
+        for obj in textobjs:
+            x, y = obj.center()
+            xs.append(x)
+            ys.append(y)
+
+        # get the x-coordinates of all the characters between epsilon
+        # and 1-epsilon from the lowest and highest y character
+        ymin = min(ys)
+        ymax = max(ys)
+        ylwr = ymin + epsilon*(ymax - ymin)
+        yupr = ymax - epsilon*(ymax - ymin)
+        inbounds_xs = [x for (x, y) in zip(xs, ys) if ylwr<y<yupr]
+
+        # # DEBUG print out distribution of inbounds_xs
+        # print '\n'.join(map(str, inbounds_xs))
+        # fuck
+
+        # test to see if text is in a single column by testing to see
+        # if we can not reject the hypothesis that the characters are
+        # drawn from a uniform distribution. If we can't reject the
+        # hypothesis that the characters are uniformly distributed,
+        # return the full column width (-inf, inf)
+        pvalue, can_reject = self.can_reject_uniform(inbounds_xs, n_edge_bins=2)
+        if not can_reject:
+            return [(float('-inf'), float('inf'))]
+
+        # test to see if this is a two column format by checking if
+        # the left and right hand characters are uniformly
+        # distributed.
+        #
+        # NOTE: THIS WOULD BE BETTER IF WE INFERRED THE MOST LIKELY
+        # xmid INSTEAD OF SPECIFYING IT AS THE HALFWAY POINT BUT THIS
+        # WORKS PRETTY DARN WELL
+        #
+        # NOTE: THIS WILL NOT WORK WELL WHEN DEALING WITH TEXT BOXES
+        # IN THE MARGIN OR OTHER FORMATTING ODDITIES. WOULD
+        # PREFERRABLY FIT A MODEL TO LEARN COLUMNS AND LINES
+        xmid = 0.5*(inbounds_xs[0] + inbounds_xs[-1])
+        left_xs = [x for x in inbounds_xs if x < xmid]
+        right_xs = [x for x in inbounds_xs if x > xmid]
+        left_pvalue, left_can_reject = self.can_reject_uniform(
+            left_xs,
+            n_edge_bins=2
+        )
+        right_pvalue, right_can_reject = self.can_reject_uniform(
+            right_xs,
+            n_edge_bins=2
+        )
+        if not (left_can_reject and right_can_reject):
+            return [
+                (min(left_xs), max(left_xs)),
+                (min(right_xs), max(right_xs)),
+            ]
+
+        raise NotImplementedError(">2 columns not currently detected")
+
+    def get_lines(self, textobjs, column_x_bounds):
+        """Get the lines by inspecting the y-coordinate of all text that falls
+        in the column_x_bounds=(xmin, xmax).
+        """
+        xmin, xmax = column_x_bounds
+        inbounds_textobjs = [
+            obj for obj in textobjs if xmin<=obj.center()[0]<=xmax
+        ]
+
+        # aggregate the unique y-values which correspond with
+        # different lines in this column
+        #
+        # NOTE: SHOULD PROBABLY MAKE SURE THAT THE RESULTING line_ys
+        # ARE SUFFICIENTLY FAR APART TO ACTUALLY BE DIFFERENT
+        # LINES. SOMETHING TELLS ME THAT KEYING A DICTIONARY ON A
+        # FLOATING POINT NUMBER IS A V V V V BAD IDEA
+        line_ys = collections.defaultdict(list)
+        for obj in inbounds_textobjs:
+            x, y = obj.center()
+            line_ys[y].append(obj)
+
+        # return the lines in decreasing order of y-value (zero point
+        # is at the bottom of the page)
+        decorated = line_ys.items()
+        decorated.sort(reverse=True)
+
+        return zip(*decorated)[1]
+
+    def get_words(self, textobjs):
+        """Identify which chunks of text belong to the same word by ordering
+        on the x-coordinate and looking at the distribution of
+        distances between adjascent characters. This distribution
+        should be bi-modal, the small x-values corresponding with the
+        kerning between adjascent characters in the word and the
+        larger x-values corresponding with the size of the space
+        character on that line.
+        """
+        words = []
+        textobjs.sort(key=lambda obj: obj.xc)
+
+        # some pdfs already have space characters in them so this is
+        # super duper easy
+        if any((obj.get_text() == ' ' for obj in textobjs)):
+            word, words = [], []
+            for obj in textobjs:
+                if obj.get_text() == ' ':
+                    words.append(word)
+                    word = []
+                else:
+                    word.append(obj)
+            if word:
+                words.append(word)
+
+        else:
+            # print len(textobjs)
+            # for obj in textobjs:
+            #     print obj.get_text().encode('utf-8'), obj.is_empty()
+
+
+            pass
+            # raise NotImplementedError(
+            #     "need to deal with case where whitespace isn't embedded in pdf"
+            # )
+
+           #  dxs = []
+           #  for obj0, obj1 in zip(textobjs[:-1], textobjs[1:]):
+           #      dxs.append(obj1.x0 - obj0.x1)
+           #      print obj1.x0 - obj0.x1, obj0.get_text(), obj1.get_text()
+
+           # print '\n'.join(map(str, dxs))
+
+        return words
+        
+
+
     def analyze(self, laparams):
         # textobjs is a list of LTChar objects, i.e.
         # it has all the individual characters in the page.
@@ -671,20 +852,44 @@ class LTLayoutContainer(LTContainer):
             obj.analyze(laparams)
         if not textobjs:
             return
-        textlines = list(self.group_objects(laparams, textobjs))
-        (empties, textlines) = fsplit(lambda obj: obj.is_empty(), textlines)
-        for obj in empties:
-            obj.analyze(laparams)
-        textboxes = list(self.group_textlines(laparams, textlines))
-        if textboxes:
-            self.groups = self.group_textboxes(laparams, textboxes)
-            assigner = IndexAssigner()
-            for group in self.groups:
-                group.analyze(laparams)
-                assigner.run(group)
-            textboxes.sort(key=lambda box: box.index)
-        self._objs = textboxes + otherobjs + empties
-        return
+
+        # find the boundary of the columns
+        column_x_bounds = self.get_column_x_bounds(textobjs)
+
+        # find the lines within the columns
+        for column_x_bnds in column_x_bounds:
+            lines = self.get_lines(textobjs, column_x_bnds)
+
+            # find the words within the line
+            for line in lines:
+                words = self.get_words(line)
+                
+                # DEBUG
+                for word in words:
+                    s = ''.join(obj.get_text().encode('utf-8') for obj in word)
+                    print s,
+                print ''
+
+                # XXXX LEFT OFF HERE. NEED TO FIGURE OUT HOW TO
+                # INTEGRATE INTO PDFMINER'S GOOFINESS
+                # * obj.analyze?!?!
+                # * LTTextLine vs LTTextBox objects?
+                # * replacing self._objs
+
+        # textlines = list(self.group_objects(laparams, textobjs))
+        # (empties, textlines) = fsplit(lambda obj: obj.is_empty(), textlines)
+        # for obj in empties:
+        #     obj.analyze(laparams)
+        # textboxes = list(self.group_textlines(laparams, textlines))
+        # if textboxes:
+        #     self.groups = self.group_textboxes(laparams, textboxes)
+        #     assigner = IndexAssigner()
+        #     for group in self.groups:
+        #         group.analyze(laparams)
+        #         assigner.run(group)
+        #     textboxes.sort(key=lambda box: box.index)
+        # self._objs = textboxes + otherobjs + empties
+        # return
 
 
 ##  LTFigure
